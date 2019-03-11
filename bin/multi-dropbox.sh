@@ -48,7 +48,7 @@ md_usage() {
 	  stop       stop all Dropbox instances
 	  status     give the status of each Dropbox instance
 	  killall    forcibly stop ANY Dropbox instance
-          homes      display the HOME=... required to use each instance
+	  homes      display the HOME=... required to use each instance
 	EOF
 }
 
