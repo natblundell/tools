@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# git-prune.hs by Nat Blundell <nat@tepic.co.uk>
+# git-prune.sh by Nat Blundell <nat@tepic.co.uk>
 #
 # Copyright 2016-2019 Nat Blundell. All rights reserved.
 #
@@ -25,7 +25,8 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-# TODO: Is there a better way to check for the default/primary branch than guessing?
+# TODO: #1 Is there a better way to check for the default/primary branch than
+# guessing at "master"?
 git checkout master && \
 git fetch -p && \
 for branch in `git branch -vv | grep ': gone]' | awk '{print $1}'`; do
