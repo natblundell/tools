@@ -25,9 +25,11 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-# TODO: #1 Is there a better way to check for the default/primary branch than
-# guessing at "master"?
-git checkout master && \
+
+git branch -a > /dev/null
+MASTER=`git remote show origin | grep 'HEAD branch' | cut -d: -f2`
+
+git checkout $MASTER && \
 git fetch -p && \
 for branch in `git branch -vv | grep ': gone]' | awk '{print $1}'`; do
     git branch -D $branch; 
