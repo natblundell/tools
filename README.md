@@ -102,3 +102,11 @@ origin.
 ```bash
 git-prune.sh
 ```
+
+## wifi-scan-cli.sh
+
+Wrapper for `nmcli` continuously displaying active WiFi channels, power, etc.
+
+```bash
+wifi-scan-cli.sh
+```
