@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+
+"""Helper tool to configure and manage VirtualBox VMs."""
+
+import argparse
+import os
+import subprocess
+import sys
+from functools import cache
+from typing import Any, Dict, List
+
+from ruamel.yaml import YAML
+
+NIC_HARDWARE_TYPE = "82540EM"
+
+
+class NIC:
+    """Represents a single network interface on a VirtualBox VM.
+
+    Validates NIC naming, type, and optional attributes such as network name,
+    MAC address, and cable connection state.
+    """
+
+    def __init__(self, name: str, config: Dict[str, Any]):
+        self.name = name
+
+        # Validate NIC name format: nic1..nic8 only
+        if not isinstance(self.name, str) or not self.name.startswith("nic"):
+            raise ValueError(
+                f"NIC name '{self.name}' is invalid: must start with 'nic'"
+            )
+
+        try:
+            index = int(self.name[3:])
+        except ValueError:
+            raise ValueError(f"NIC name '{self.name}' is invalid: must be nic1..nic8")
+
+        if not (1 <= index <= 8):
+            raise ValueError(
+                f"NIC name '{self.name}' is invalid: number must be between 1 and 8"
+            )
+
+        # Required field
+        if "type" not in config:
+            raise KeyError(f"NIC '{name}' missing required field: type")
+
+        self.type: str = config["type"]
+
+        # Validate allowed NIC types
+        allowed_types = {"null", "none", "nat", "bridged", "intnet", "hostonly"}
+        if self.type not in allowed_types:
+            raise ValueError(
+                f"NIC '{name}': invalid type '{self.type}'. Must be one of {sorted(allowed_types)}"
+            )
+
+        self.network_name: str | None = config.get("network_name")
+
+        # Validation: intnet and hostonly require a network name
+        if self.type in {"intnet", "hostonly"} and not self.network_name:
+            raise ValueError(
+                f"NIC '{name}': type '{self.type}' requires 'network_name'"
+            )
+
+        self.macaddr: str | None = config.get("macaddr")
+
+        # Determine default cable connection
+        if "cable-connected" in config:
+            self.cable_connected: bool | None = config.get("cable-connected")
+        else:
+            if self.type in {"null", "none"}:
+                self.cable_connected = None
+            else:
+                self.cable_connected = True
+
+    def __repr__(self) -> str:
+        return (
+            f"NIC(name={self.name!r}, type={self.type!r}, "
+            f"network_name={self.network_name!r}, macaddr={self.macaddr!r}, "
+            f"cable_connected={self.cable_connected!r})"
+        )
+
+
+class VirtualMachine:
+    """Represents a single VirtualBox virtual machine.
+
+    Stores core VM configuration such as RAM, CPU count, optional disk size,
+    and associated NIC definitions.
+    """
+
+    def __init__(self, name: str, config: Dict[str, Any]):
+        self.name = name
+
+        # Required fields
+        if "ram" not in config:
+            raise KeyError(f"VM '{name}' missing required field: ram")
+        if "cpus" not in config:
+            raise KeyError(f"VM '{name}' missing required field: cpus")
+
+        self.ram: int = config["ram"]
+        self.cpus: int = config["cpus"]
+        self.hdd: int | None = config.get("hdd")
+
+        # Validation
+        if not isinstance(self.ram, int) or not (128 <= self.ram <= 32768):
+            raise ValueError(
+                f"VM '{name}': ram must be int in range 128-32768, got {self.ram!r}"
+            )
+        if not isinstance(self.cpus, int) or not (1 <= self.cpus <= 16):
+            raise ValueError(
+                f"VM '{name}': cpus must be int in range 1-16, got {self.cpus!r}"
+            )
+
+        # NIC validation (structure only)
+        if "nics" in config and not isinstance(config["nics"], dict):
+            raise TypeError(f"VM '{name}': nics must be a dict if provided")
+
+        self.nics: List[NIC] = []
+        for nic_name, nic_data in config.get("nics", {}).items():
+            if not isinstance(nic_data, dict):
+                raise TypeError(
+                    f"VM '{name}': NIC '{nic_name}' must be a mapping (dict)"
+                )
+            self.nics.append(NIC(name=nic_name, config=nic_data))
+
+    def __repr__(self) -> str:
+        return (
+            f"VirtualMachine(name={self.name!r}, ram={self.ram}, "
+            f"cpus={self.cpus}, hdd={self.hdd}, nics={[repr(nic) for nic in self.nics]})"
+        )
+
+
+class Inventory:
+    """Represents a collection of VirtualMachine objects loaded from a YAML inventory file.
+
+    Provides lookup utilities for retrieving VMs by name.
+    """
+
+    def __init__(self, vms: List[VirtualMachine]):
+        self.vms = vms
+
+    @staticmethod
+    def load_inventory(inventory: str) -> "Inventory":
+        """Load a YAML inventory file and construct an Inventory instance.
+
+        Args:
+            inventory: Path to the YAML inventory file.
+
+        Returns:
+            Inventory: Parsed inventory containing VirtualMachine objects.
+        """
+        if not os.path.exists(inventory):
+            raise FileNotFoundError(f"Inventory file not found: {inventory}")
+
+        yaml = YAML(typ="safe")
+
+        with open(inventory, "r", encoding="utf-8") as f:
+            data = yaml.load(f)
+
+        if data is None:
+            data = {}
+
+        if not isinstance(data, dict):
+            raise TypeError("Inventory file must contain a top-level mapping (dict)")
+
+        vms: List[VirtualMachine] = []
+
+        for name, vm_data in data.items():
+            if not isinstance(vm_data, dict):
+                raise TypeError(f"VM entry '{name}' must be a mapping (dict)")
+
+            vms.append(VirtualMachine(name=name, config=vm_data))
+
+        return Inventory(vms)
+
+    def get_vm_by_name(self, name: str) -> VirtualMachine | None:
+        """Return the first VM matching a given name.
+
+        Matching is case-insensitive and supports both full names and short
+        names (portion before the first dot).
+
+        Args:
+            name: VM name or short name to search for.
+
+        Returns:
+            VirtualMachine or None if no match is found.
+        """
+        target = name.lower()
+
+        for vm in self.vms:
+            vm_name_lower = vm.name.lower()
+
+            # Exact match
+            if vm_name_lower == target:
+                return vm
+
+            # Match before domain (first '.')
+            if "." in vm_name_lower:
+                short_name = vm_name_lower.split(".", 1)[0]
+                if short_name == target:
+                    return vm
+
+        return None
+
+
+@cache
+def get_default_gateway():
+    """Return the default network interface used for outbound traffic.
+
+    Executes `ip route show default` and extracts the device name.
+
+    Returns:
+        str: Network interface name (e.g. eth0).
+
+    Raises:
+        RuntimeError: If no default route is found or output format is unexpected.
+    """
+    result = subprocess.run(
+        ["ip", "route", "show", "default"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout.strip()
+    if not output:
+        raise RuntimeError("No default gateway found in 'ip route show default' output")
+    # The output is expected to be in the format: "default via <gateway> dev <device> ..."
+    parts = output.split()
+    if (
+        len(parts) < 5
+        or parts[0] != "default"
+        or parts[1] != "via"
+        or parts[3] != "dev"
+    ):
+        raise RuntimeError(
+            f"Unexpected output format from 'ip route show default': {output}"
+        )
+    return parts[4]
+
+
+def call_vbox(cmd: List[str], dry_run: bool = False, verbose: int = 0):
+    """Execute a VBoxManage command.
+
+    Args:
+        cmd: Command and arguments as a list of strings.
+        dry_run: If True, print the command instead of executing it.
+        verbose: If greater than zero, print the command before execution.
+
+    Returns:
+        subprocess.CompletedProcess or None when in dry-run mode.
+
+    Args:
+        cmd: Command and arguments as a list of strings.
+        dry_run: If True, only print command.
+        verbose: If > 0, print command before execution.
+    """
+    if dry_run:
+        print("DRY RUN:", " ".join(cmd))
+        return None
+
+    if verbose:
+        print("EXEC:", " ".join(cmd))
+
+    return subprocess.run(cmd, check=True)
+
+
+def exec_list(args: argparse.Namespace) -> None:
+    """List all known virtual machines.
+
+    Displays a table including VM name, RAM, CPU count, and number of active NICs.
+    """
+    inventory = Inventory.load_inventory(args.inventory)
+
+    # Optional: fetch a specific VM if vm_name is provided
+    if hasattr(args, "vm_name") and args.vm_name:
+        vm = inventory.get_vm_by_name(args.vm_name)
+        if vm is None:
+            raise ValueError(f"VM '{args.vm_name}' not found")
+        vms = [vm]
+    else:
+        vms = sorted(inventory.vms, key=lambda vm: vm.name)
+
+    header = f"{'VM Name':30} {'RAM (MiB)':>10} {'# CPUs':>7} {'# NICs':>6}"
+    print(header)
+    print("-" * len(header))
+
+    for vm in vms:
+        nic_count = sum(1 for nic in vm.nics if nic.type not in {"null", "none"})
+        print(f"{vm.name:30} {vm.ram:10} {vm.cpus:7} {nic_count:6}")
+
+
+def exec_show(args: argparse.Namespace) -> None:
+    """Display detailed information about a specific VM.
+
+    Shows VM configuration and a table of all NICs, including undefined ones.
+    """
+    inventory = Inventory.load_inventory(args.inventory)
+
+    vm = inventory.get_vm_by_name(args.vm_name)
+    if vm is None:
+        raise ValueError(f"VM '{args.vm_name}' not found")
+
+    # Display VM summary
+    print(f"VM Name : {vm.name}")
+    print(f"RAM     : {vm.ram} MiB")
+    print(f"CPUs    : {vm.cpus}")
+    print(f"HDD     : {vm.hdd if vm.hdd is not None else '-'}")
+
+    # Build NIC lookup by name
+    nic_map = {nic.name: nic for nic in vm.nics}
+
+    print()
+    header = f"{'NIC':6} {'Ttype':10} {'Network Name':20} {'MAC Addr':20} {'Initial connect':16}"
+    print(header)
+    print("-" * len(header))
+
+    # Iterate nic1..nic8 in order, include undefined
+    for i in range(1, 9):
+        name = f"nic{i}"
+        nic = nic_map.get(name)
+
+        if nic is None:
+            typ = None
+            network_name = None
+            macaddr = None
+            cable_connected = None
+        else:
+            typ = nic.type
+            network_name = nic.network_name
+            macaddr = nic.macaddr
+            cable_connected = nic.cable_connected
+
+        def fmt(v):
+            return "-" if v is None else str(v)
+
+        def fmt_mac(v):
+            return "-" if v is None else str(v).lower()
+
+        def fmt_bool(v):
+            if v is None:
+                return "-"
+            return "yes" if v else "no"
+
+        print(
+            f"{name:6} {fmt(typ):10} {fmt(network_name):20} {fmt_mac(macaddr):20} {fmt_bool(cable_connected):16}"
+        )
+
+
+def exec_configure(args: argparse.Namespace) -> None:
+    """Apply configuration from the inventory to a VM.
+
+    Updates VM hardware settings and configures all NICs using VBoxManage.
+    """
+    inventory = Inventory.load_inventory(args.inventory)
+
+    vm = inventory.get_vm_by_name(args.vm_name)
+    if vm is None:
+        raise ValueError(f"VM '{args.vm_name}' not found")
+
+    # Basic VM configuration
+    basic_cmd = [
+        "VBoxManage",
+        "modifyvm",
+        vm.name,
+        "--memory",
+        str(vm.ram),
+        "--cpus",
+        str(vm.cpus),
+        "--drag-and-drop",
+        "disabled",
+        "--clipboard-mode",
+        "disabled",
+    ]
+
+    call_vbox(basic_cmd, dry_run=args.dry_run, verbose=args.verbose)
+
+    # NIC configuration (nic1 - nic8)
+    nic_map = {nic.name: nic for nic in vm.nics}
+
+    for i in range(1, 9):
+        nic_name = f"nic{i}"
+        nic = nic_map.get(nic_name)
+
+        nic_type = nic.type if nic is not None else "none"
+        cable_connected = nic.cable_connected if nic is not None else None
+
+        match nic_type:
+            case "null" | "none" | "nat":
+                cmd = [
+                    "VBoxManage",
+                    "modifyvm",
+                    vm.name,
+                    f"--nic{i}",
+                    nic_type,
+                    f"--cable-connected{i}",
+                    "on" if cable_connected else "off",
+                ]
+                call_vbox(cmd, dry_run=args.dry_run, verbose=args.verbose)
+
+            case "bridged":
+                cmd = [
+                    "VBoxManage",
+                    "modifyvm",
+                    vm.name,
+                    f"--nic{i}",
+                    nic_type,
+                    f"--bridge-adapter{i}",
+                    get_default_gateway(),
+                    f"--cable-connected{i}",
+                    "on" if cable_connected else "off",
+                ]
+                call_vbox(cmd, dry_run=args.dry_run, verbose=args.verbose)
+
+            case "intnet":
+                cmd = [
+                    "VBoxManage",
+                    "modifyvm",
+                    vm.name,
+                    f"--nic{i}",
+                    nic_type,
+                    f"--intnet{i}",
+                    nic.network_name,
+                    f"--nictype{i}",
+                    NIC_HARDWARE_TYPE,
+                    f"--cable-connected{i}",
+                    "on" if cable_connected else "off",
+                ]
+
+                # Optional MAC address for intnet NICs
+                if nic.macaddr:
+                    cmd.extend([f"--macaddress{i}", nic.macaddr.lower()])
+
+                call_vbox(cmd, dry_run=args.dry_run, verbose=args.verbose)
+
+            case "hostonly":
+                cmd = [
+                    "VBoxManage",
+                    "modifyvm",
+                    vm.name,
+                    f"--nic{i}",
+                    nic_type,
+                    f"--hostonlyadapter{i}",
+                    nic.network_name,
+                    f"--nictype{i}",
+                    NIC_HARDWARE_TYPE,
+                    f"--cable-connected{i}",
+                    "on" if cable_connected else "off",
+                ]
+                call_vbox(cmd, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def do_connect(args: argparse.Namespace, on_off: str) -> None:
+    """Connect a virtual network cable to a specified NIC on a VM.
+
+    Resolves NIC identifiers in the following forms:
+    - nic[1-8]
+    - eth[0-7] -> mapped to nic{eth+1}
+    - numeric [1-8] -> nic{number}
+    - otherwise matches NIC by network_name
+    """
+    inventory = Inventory.load_inventory(args.inventory)
+
+    vm = inventory.get_vm_by_name(args.vm_name)
+    if vm is None:
+        raise ValueError(f"VM '{args.vm_name}' not found")
+
+    ident = args.nic_id
+
+    # Resolve NIC name
+    nic_name: str | None = None
+
+    if isinstance(ident, str) and ident.startswith("nic") and ident[3:].isdigit():
+        nic_name = ident
+
+    elif isinstance(ident, str) and ident.startswith("eth") and ident[3:].isdigit():
+        idx = int(ident[3:]) + 1
+        nic_name = f"nic{idx}"
+
+    elif isinstance(ident, str) and ident.isdigit():
+        idx = int(ident)
+        if 1 <= idx <= 8:
+            nic_name = f"nic{idx}"
+
+    # Build NIC lookup
+    nic = None
+
+    if nic_name:
+        for n in vm.nics:
+            if n.name == nic_name:
+                nic = n
+                break
+    else:
+        for n in vm.nics:
+            if n.network_name == ident:
+                nic = n
+                break
+
+    if nic is None:
+        raise ValueError(f"NIC '{ident}' not found on VM '{vm.name}'")
+
+    # Determine index from nic name
+    idx = int(nic.name[3:])
+    cmd = [
+        "VBoxManage",
+        "controlvm",
+        vm.name,
+        f"setlinkstate{idx}",
+        on_off,
+    ]
+
+    call_vbox(cmd, dry_run=args.dry_run, verbose=args.verbose)
+
+
+def exec_connect(args: argparse.Namespace) -> None:
+    do_connect(args, "on")
+
+
+def exec_disconnect(args: argparse.Namespace) -> None:
+    do_connect(args, "off")
+
+
+def get_parser() -> argparse.ArgumentParser:
+    """Construct and return the command-line argument parser.
+
+    Defines global options and subcommands for VM management operations.
+    """
+
+    def add_vm_name(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "vm_name",
+            type=str,
+            metavar="VM_NAME|SHORT_NAME",
+            help="Name (or short name) of the VM to configure",
+        )
+
+    def add_dry_run(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "-n",
+            "--dry-run",
+            action="store_true",
+            help="Display actions without executing them",
+        )
+
+    parser = argparse.ArgumentParser(
+        os.path.basename(os.path.realpath(__file__)), description=__doc__
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Enable verbose logging to stdout (can be used multiple times for more verbosity)",
+    )
+    parser.add_argument(
+        "-i",
+        "--inventory",
+        metavar="VM_SPEC_FILE",
+        type=str,
+        action="store",
+        default=os.environ.get("VM_SPEC_FILE", "./vm-spec.json"),
+        help='Use VM_SPEC_FILE for the specifications of the VMS. (Default "%(default)s" taken from `VM_SPEC_FILE` envvar)',
+    )
+    subparsers = parser.add_subparsers(required=True)
+
+    # vbox-helper list
+    sub_list = subparsers.add_parser("list", help="List known VMs.")
+    sub_list.set_defaults(exec=exec_list)
+
+    # vbox-helper show VM_NAME
+    sub_show = subparsers.add_parser(
+        "show",
+        help="Display detailed info on the VM.",
+    )
+    sub_show.set_defaults(exec=exec_show)
+    add_vm_name(sub_show)
+
+    # vbox-helper configure VM_NAME
+    sub_conf = subparsers.add_parser(
+        "configure",
+        aliases=["conf"],
+        help="Reset the VM's configuration to match the inventory.",
+    )
+    sub_conf.set_defaults(exec=exec_configure)
+    add_dry_run(sub_conf)
+    add_vm_name(sub_conf)
+
+    # vbox-helper connect VM_NAME NIC0-8
+    sub_conn = subparsers.add_parser(
+        "connect",
+        aliases=["con"],
+        help="Connect the virtual network cable to a NIC.",
+    )
+    sub_conn.set_defaults(exec=exec_connect)
+    add_dry_run(sub_conn)
+    add_vm_name(sub_conn)
+    sub_conn.add_argument(
+        "nic_id",
+        type=str,
+        metavar="NIC_IDENTIFIER",
+        help="The number, name or ethX reference of the VM NIC to disconnect (e.g. nic5, 5, eth4, internet-dmz).",
+    )
+
+    # vbox-helper disconnect VM_NAME NIC0-8
+    sub_discconn = subparsers.add_parser(
+        "disconnect",
+        aliases=["dis"],
+        help="Disconnect the virtual network cable from a NIC.",
+    )
+    sub_discconn.set_defaults(exec=exec_disconnect)
+    add_dry_run(sub_discconn)
+    add_vm_name(sub_discconn)
+    sub_discconn.add_argument(
+        "nic_id",
+        type=str,
+        metavar="NIC_IDENTIFIER",
+        help="The number, name or ethX reference of the VM NIC to disconnect (e.g. nic5, 5, eth4, internet-dmz).",
+    )
+
+    return parser
+
+
+def run(argv: List[str]) -> None:
+    """Entry point for command-line execution.
+
+    Parses arguments and dispatches to the selected subcommand.
+    """
+    args = get_parser().parse_args(argv[1:])
+    args.exec(args)
+
+
+if __name__ == "__main__":
+    run(sys.argv)
